@@ -27,6 +27,6 @@ G -- Useless --> A
 
 1. 執行 `python app.py`
 2. 在輸入框中輸入問題
-![alt text](image.png)
-3. 點擊回應查看相關資料
 ![alt text](image-1.png)
+3. 點擊回應查看相關資料
+![alt text](image-2.png)
