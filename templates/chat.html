@@ -80,12 +80,12 @@
     <div class="input-container">
         <input type="text" id="user-input" onkeydown="sendMessage(this)" placeholder="Type a message..." autofocus>
     </div>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.0/socket.io.js"></script>
     <script>
-
         async function sendMessage(inputElement) {
-            const userMessage = inputElement.value.trim();
-
             if(event.key !== 'Enter') return;
+
+            const userMessage = inputElement.value.trim();
 
             if (userMessage === '') return;
 
@@ -129,19 +129,19 @@
             chatBox.appendChild(referencesElement);
             chatBox.scrollTop = chatBox.scrollHeight;
 
-            const response = await fetch('/chat', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                body: JSON.stringify({ message: userMessage })
+            var socket = io();
+
+            const requestData = {
+                message: userMessage
+            };
+
+            socket.emit('request', requestData);
+
+            socket.on('response', function(data) {
+                messageElement.textContent = data.message;
+                referencesElement.innerHTML = data.references;
+                chatBox.scrollTop = chatBox.scrollHeight;
             });
-            const data = await response.json();
-
-            messageElement.textContent = data.message;
-            referencesElement.innerHTML = data.references;
-
-            chatBox.scrollTop = chatBox.scrollHeight;
         }
     </script>
 </body>

@@ -11,8 +11,8 @@ from langchain_core.prompts import PromptTemplate
 
 from langchain_core.output_parsers import StrOutputParser
 
-from flask import Flask, render_template, request, jsonify
-
+from flask import Flask, render_template
+from flask_socketio import SocketIO, emit
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
@@ -33,7 +33,7 @@ def get_retriever(filenames = None):
     docs_list = [item for sublist in docs for item in sublist]
 
     text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        chunk_size=250, chunk_overlap=0
+        chunk_size=250, chunk_overlap=100
     )
     doc_splits = text_splitter.split_documents(docs_list)
 
@@ -71,7 +71,7 @@ def check_relevance(retriever = None, question = None):
     references = ""
     for doc in docs:
         doc_page, doc_source, doc_txt = doc.metadata["page"], doc.metadata["source"], doc.page_content
-        references += f'At page {doc_page} of "{doc_source}" wrote:<br>\n'
+        references += f'{doc_source} 第{doc_page}頁:<br>\n'
         for line in doc.page_content.split('\n'):
             references += f"{line}<br>\n"
         references += "<br>\n"
@@ -86,7 +86,7 @@ def retrieve_answer(retriever = None, question = None):
     # Prompt
     prompt = PromptTemplate(
         template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are an assistant for question-answering tasks. 
-        Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. 
+        Use the following pieces of retrieved context to answer the question in traditional Chinese. If you don't know the answer, just say that you don't know. 
         Use three sentences maximum and keep the answer concise <|eot_id|><|start_header_id|>user<|end_header_id|>
         Question: {question} 
         Context: {context} 
@@ -107,9 +107,8 @@ def retrieve_answer(retriever = None, question = None):
 
     # Run
     docs = retriever.invoke(question)
-    
-    generation = rag_chain.invoke({"context": docs, "question": question})
-    return generation
+
+    return rag_chain.stream({"context": docs, "question": question})
 
 ### Hallucination Grader
 
@@ -158,40 +157,45 @@ def check_usefulness(question = None, generation = None):
     return response
 
 app = Flask(__name__)
+socketio = SocketIO(app)
 
 @app.route('/')
 def home():
     return render_template('chat.html')
 
-@app.route('/chat', methods=['POST'])
-def chat():
-    user_message = request.json.get('message')
-    response_message, response_references = generate_response(user_message)
-    return jsonify({'message': response_message, 'references': response_references})
+@socketio.on('request')
+def handle_request(data):
+    message = data.get('message')
+    
+    docs, relevance, references = check_relevance(retriever = retriever, question = message)
+    
+    if relevance == 'irrelevant':
+        emit('response', {'message': "The question is considered irrelevant.", 'references': "N/A"})
+        return
+
+    generation = ""
+    for chunk in retrieve_answer(retriever = retriever, question = message):
+        generation += chunk
+        emit('response', {'message': generation, 'references': references})
+
+    clear_mindedness = check_hallucination(docs = docs, generation = generation)
+    if clear_mindedness == 'hallucinating':
+        emit('response', {'message': "The assistant is hallucinating.", 'references': "N/A"})
+        return
+
+    usefulness = check_usefulness(question = message, generation = generation)
+    if usefulness == 'useless':
+        emit('response', {'message': "The response is useless.", 'references': "N/A"})
+        return
+
+    emit('response', {'message': generation, 'references': references})
+    return
 
 print("loading pdfs...")
 filenames = next(os.walk(documents_directory), (None, None, []))[2]
 retriever = get_retriever(filenames = filenames)
 print("pdfs loaded.")
-
-def generate_response(message):
-
-    docs, relevance, references = check_relevance(retriever = retriever, question = message)
-    
-    if relevance == 'irrelevant':
-        return "The question is considered irrelevant.", "N/A"
-
-    generation = retrieve_answer(retriever = retriever, question = message)
-
-    clear_mindedness = check_hallucination(docs = docs, generation = generation)
-    if clear_mindedness == 'hallucinating':
-        return "The assistant is hallucinating.", "N/A"
-
-    usefulness = check_usefulness(question = message, generation = generation)
-    if usefulness == 'useless':
-        return "The response is useless.", "N/A"
-
-    return generation, references
     
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    socketio.run(app)
+    # app.run(host='0.0.0.0', port=5000)
