@@ -9,10 +9,10 @@ from langchain_community.chat_models import ChatOllama
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import PromptTemplate
 
-from langchain_core.output_parsers import StrOutputParser
-
 from flask import Flask, render_template
 from flask_socketio import SocketIO, emit
+
+import ollama
 
 os.environ["LANGCHAIN_TRACING_V2"] = "true"
 os.environ["LANGCHAIN_ENDPOINT"] = "https://api.smith.langchain.com"
@@ -49,66 +49,59 @@ def get_retriever(filenames = None):
 ### Retrieval Grader
 
 def check_relevance(retriever = None, question = None):
-    # LLM
-    llm = ChatOllama(model=local_llm, format="json", temperature=0)
-
-    prompt = PromptTemplate(
-        template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are a grader assessing relevance 
-        of a retrieved document to a user question. If the document contains keywords related to the user question, 
-        grade it as relevant. It does not need to be a stringent test. The goal is to filter out erroneous retrievals. \n
-        Give a binary score 'relevant' or 'irrelevant' score to indicate whether the document is relevant to the question. \n
-        Provide the binary score as a JSON with a single key 'score' and no premable or explanation.
-         <|eot_id|><|start_header_id|>user<|end_header_id|>
-        Here is the retrieved document: \n\n {document} \n\n
-        Here is the user question: {question} \n <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-        """,
-        input_variables=["question", "document"],
-    )
-
-    retrieval_grader = prompt | llm | JsonOutputParser()
+    
     docs = retriever.invoke(question)
-    
-    references = ""
-    for doc in docs:
-        doc_page, doc_source, doc_txt = doc.metadata["page"], doc.metadata["source"], doc.page_content
-        references += f'{doc_source} 第{doc_page}頁:<br>\n'
-        for line in doc.page_content.split('\n'):
-            references += f"{line}<br>\n"
-        references += "<br>\n"
-    
+      
     doc_txt = docs[0].page_content
-    response = retrieval_grader.invoke({"question": question, "document": doc_txt})
-    return docs, response, references
+    
+    system_prompt = """
+        You are a grader assessing relevance of a retrieved document to a user question. 
+        If the document contains keywords related to the user question, grade it as relevant. 
+        It does not need to be a stringent test. 
+        The goal is to filter out erroneous retrievals.
+        Give a binary score 'relevant' or 'irrelevant' score to indicate whether the document is relevant to the question.
+        Provide the binary score as a JSON with a single key 'score' and no premable or explanation.
+    """
+
+    user_prompt = f"""
+        Question: {question} 
+        Context: {doc_txt}  
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    response = ollama.chat(model='llama3', messages=messages)['message']['content']
+
+    return docs, response
 
 ### Generate
 
 def retrieve_answer(retriever = None, question = None):
-    # Prompt
-    prompt = PromptTemplate(
-        template="""<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are an assistant for question-answering tasks. 
-        Use the following pieces of retrieved context to answer the question in traditional Chinese. If you don't know the answer, just say that you don't know. 
-        Use three sentences maximum and keep the answer concise <|eot_id|><|start_header_id|>user<|end_header_id|>
-        Question: {question} 
-        Context: {context} 
-        Answer: <|eot_id|><|start_header_id|>assistant<|end_header_id|>""",
-        input_variables=["question", "document"],
-    )
 
-    llm = ChatOllama(model=local_llm, temperature=0)
-
-
-    # Post-processing
-    def format_docs(docs):
-        return "\n\n".join(doc.page_content for doc in docs)
-
-
-    # Chain
-    rag_chain = prompt | llm | StrOutputParser()
-
-    # Run
     docs = retriever.invoke(question)
+    
+    system_prompt = """
+        You are an assistant for question-answering tasks. 
+        Use the following pieces of retrieved context to answer the question. 
+        If you don't know the answer, just say that you don't know. 
+        Use three sentences maximum and keep the answer concise.
+        Please answer the question in traditional Chinese.
+    """
 
-    return rag_chain.stream({"context": docs, "question": question})
+    user_prompt = f"""
+        Question: {question} 
+        Context: {docs}  
+    """
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    return ollama.chat(model='llama3', messages=messages, stream=True)
 
 ### Hallucination Grader
 
@@ -166,8 +159,8 @@ def home():
 @socketio.on('request')
 def handle_request(data):
     message = data.get('message')
-    
-    docs, relevance, references = check_relevance(retriever = retriever, question = message)
+
+    docs, relevance = check_relevance(retriever = retriever, question = message)
     
     if relevance == 'irrelevant':
         emit('response', {'message': "The question is considered irrelevant.", 'references': "N/A"})
@@ -175,8 +168,8 @@ def handle_request(data):
 
     generation = ""
     for chunk in retrieve_answer(retriever = retriever, question = message):
-        generation += chunk
-        emit('response', {'message': generation, 'references': references})
+        generation += chunk['message']['content']
+        emit('response', {'message': generation, 'references': "N/A"})
 
     clear_mindedness = check_hallucination(docs = docs, generation = generation)
     if clear_mindedness == 'hallucinating':
@@ -187,6 +180,14 @@ def handle_request(data):
     if usefulness == 'useless':
         emit('response', {'message': "The response is useless.", 'references': "N/A"})
         return
+
+    references = ""
+    for doc in docs:
+        doc_page, doc_source, doc_txt = doc.metadata["page"], doc.metadata["source"], doc.page_content
+        references += f'{doc_source} 第{doc_page}頁:<br>\n'
+        for line in doc.page_content.split('\n'):
+            references += f"{line}<br>\n"
+        references += "<br>\n"
 
     emit('response', {'message': generation, 'references': references})
     return
